@@ -2,7 +2,9 @@
 
 import sys
 import tempfile
+import unittest
 from typing import Any, IO
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -29,6 +31,7 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
+    TEST_CUDA,
     TEST_WITH_DEV_DBG_ASAN,
     TestCase,
 )
@@ -143,7 +146,7 @@ class TestDistributedStateDictSaveLoad(TestCase):
                 assert_state_dict_equal(self, state_dict_to_load_to, state_dict_to_save)
 
             # Load from file without any resharding
-            fs_reader = FileSystemReader(path=path)
+            fs_reader = FileSystemReader(path=path, thread_count=thread_count)
             load_state_dict(
                 state_dict=state_dict_to_load_to,
                 storage_reader=fs_reader,
@@ -151,6 +154,38 @@ class TestDistributedStateDictSaveLoad(TestCase):
             )
 
             assert_state_dict_equal(self, state_dict_to_load_to, state_dict_to_save)
+
+
+class TestFileSystemReaderParallelRead(TestCase):
+    @unittest.skipIf(not TEST_CUDA, "CUDA not available")
+    def test_read_into_cuda_tensors_through_staging_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as path:
+            state_dict_to_save = MyTestModule().state_dict()
+            save_state_dict(
+                state_dict=state_dict_to_save,
+                storage_writer=FileSystemWriter(path=path),
+                no_dist=True,
+            )
+
+            state_dict_to_load_to = {
+                key: torch.zeros_like(value, device="cuda")
+                for key, value in state_dict_to_save.items()
+            }
+            # 64-byte chunks send each tensor through the pinned buffer several times.
+            with patch(
+                "torch.distributed.checkpoint.filesystem._STAGING_CHUNK_BYTES", 64
+            ):
+                load_state_dict(
+                    state_dict=state_dict_to_load_to,
+                    storage_reader=FileSystemReader(path=path, thread_count=2),
+                    no_dist=True,
+                )
+
+            assert_state_dict_equal(
+                self,
+                {key: value.cpu() for key, value in state_dict_to_load_to.items()},
+                state_dict_to_save,
+            )
 
 
 class TestDistributedStateDictSaveLoadRot13(TestCase):
@@ -179,7 +214,9 @@ class TestDistributedStateDictSaveLoadRot13(TestCase):
             # Load from file without any resharding.  Note there is no extension
             # specification here; it is determined dynamically from the metadata.
             fs_reader = FileSystemReader(
-                path=path, _extension_registry=get_test_extension_registry()
+                path=path,
+                _extension_registry=get_test_extension_registry(),
+                thread_count=thread_count,
             )
             load(
                 state_dict=state_dict_to_load_to,
@@ -213,7 +250,7 @@ class TestDistributedStateDictSaveLoadZStandard(TestCase):
                 assert_state_dict_equal(self, state_dict_to_load_to, state_dict_to_save)
 
             # Load from file without any resharding
-            fs_reader = FileSystemReader(path=path)
+            fs_reader = FileSystemReader(path=path, thread_count=thread_count)
             load(
                 state_dict=state_dict_to_load_to,
                 storage_reader=fs_reader,
@@ -269,7 +306,7 @@ class TestDistributedStateDictSaveLoadWithSharedTensor(MultiProcContinuousTest):
             assert_state_dict_equal(self, state_dict_to_load_to, state_dict_to_save)
 
         # Test load.
-        fs_reader = FileSystemReader(path=path)
+        fs_reader = FileSystemReader(path=path, thread_count=thread_count)
         load_state_dict(state_dict=state_dict_to_load_to, storage_reader=fs_reader)
 
         assert_state_dict_equal(self, state_dict_to_load_to, state_dict_to_save)
@@ -387,7 +424,7 @@ class TestDistributedReshardOnLoad(MultiProcContinuousTest):
                 state_dict_to_load_to = model_to_load.state_dict()
                 dist.barrier()
 
-                fs_reader = FileSystemReader(path=path)
+                fs_reader = FileSystemReader(path=path, thread_count=thread_count)
                 load_state_dict(
                     state_dict=state_dict_to_load_to, storage_reader=fs_reader
                 )
@@ -437,7 +474,7 @@ class TestDistributedReshardOnLoad(MultiProcContinuousTest):
         model_to_load._register_state_dict_hook(state_dict_hook)
         state_dict_to_load_to = model_to_load.state_dict()
 
-        fs_reader = FileSystemReader(path=path)
+        fs_reader = FileSystemReader(path=path, thread_count=thread_count)
 
         load_state_dict(state_dict=state_dict_to_load_to, storage_reader=fs_reader)
 
@@ -459,7 +496,7 @@ class TestDistributedReshardOnLoad(MultiProcContinuousTest):
 
         state_dict_to_load = {"bytes0": [2], "bytes1": "other"}
 
-        fs_reader = FileSystemReader(path=path)
+        fs_reader = FileSystemReader(path=path, thread_count=thread_count)
         load_state_dict(state_dict=state_dict_to_load, storage_reader=fs_reader)
 
         self.assertEqual([1], state_dict_to_load["bytes0"])
@@ -534,7 +571,7 @@ class TestDistributedReshardOnLoad(MultiProcContinuousTest):
                     "replicated": sharded_tensor.zeros(load_spec, tensor_size),
                 }
 
-                fs_reader = FileSystemReader(path=path)
+                fs_reader = FileSystemReader(path=path, thread_count=thread_count)
                 load_state_dict(state_dict=load_dict, storage_reader=fs_reader)
 
                 save_dict_sharded = self.load_tensor(save_dict["sharded"])

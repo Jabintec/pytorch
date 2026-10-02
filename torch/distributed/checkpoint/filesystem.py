@@ -3,15 +3,18 @@ import collections
 import dataclasses
 import io
 import json
+import mmap
 import operator
 import os
 import pickle
 import queue
+import sys
 import threading
 import uuid
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -23,6 +26,7 @@ from typing import Any, cast, Final, IO
 from typing_extensions import Buffer
 
 import torch
+import torch._weights_only_unpickler as _weights_only_unpickler
 from torch import Tensor
 from torch._utils import _get_available_device_type, _get_device_module
 from torch.distributed._shard._utils import narrow_tensor_by_index
@@ -56,6 +60,7 @@ from torch.distributed.checkpoint.storage import (
 )
 from torch.distributed.checkpoint.utils import _create_file_view
 from torch.futures import Future
+from torch.serialization import _load, _open_zipfile_reader
 
 
 __all__ = [
@@ -842,12 +847,54 @@ class _StorageReaderTransforms:
         return transform_from
 
 
+# Bytes read from each end of an item to decode it: its zip header and directory.
+_ZIP_EDGE_BYTES = 64 * 1024
+# Pinned buffer each reader thread passes accelerator-bound tensor bytes through.
+_STAGING_CHUNK_BYTES = 32 * 1024 * 1024
+
+
+def _default_read_thread_count() -> int:
+    """Split a node-wide budget of 32 read threads across the ranks on this node."""
+    local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE") or 1))
+    return max(1, min(32, os.cpu_count() or 1) // local_world_size)
+
+
+def _read_into(stream: io.IOBase, buffer: memoryview, offset: int) -> None:
+    stream.seek(offset)
+    if cast(io.BufferedIOBase, stream).readinto(buffer) != len(buffer):
+        raise EOFError(f"Expected {len(buffer)} bytes at offset {offset}")
+
+
+def _has_thread_safe_tensor_hooks(planner: LoadPlanner) -> bool:
+    """Whether the tensor hooks are ``DefaultLoadPlanner``'s, which only read state."""
+    from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+
+    return isinstance(planner, DefaultLoadPlanner) and all(
+        getattr(type(planner), name) is getattr(DefaultLoadPlanner, name)
+        for name in (
+            "resolve_tensor",
+            "commit_tensor",
+            "lookup_tensor",
+            "transform_tensor",
+        )
+    )
+
+
 class FileSystemReader(StorageReader):
     def __init__(
         self,
         path: str | os.PathLike,
         _extension_registry: ExtensionRegistry | None = None,  # EXPERIMENTAL
+        thread_count: int | None = None,
     ) -> None:
+        """
+        Initialize the reader pointing to `path`.
+
+        Args:
+            path: Directory where the checkpoint was written.
+            thread_count: Number of IO threads to use to read. Default to
+                ``min(32, cpu_count) // local_world_size``; 1 reads items one at a time.
+        """
         super().__init__()
         self.fs = FileSystem()
         self.path = self.fs.init_path(path)
@@ -856,6 +903,9 @@ class FileSystemReader(StorageReader):
         self.transforms = _StorageReaderTransforms(_extension_registry)
         self.rank = None
         self.use_collectives = True
+        self.thread_count = (
+            _default_read_thread_count() if thread_count is None else thread_count
+        )
 
     def _slice_file(self, file, sinfo: _StorageInfo) -> IO[bytes]:
         return cast(IO[bytes], _create_file_view(file, sinfo.offset, sinfo.length))
@@ -867,6 +917,9 @@ class FileSystemReader(StorageReader):
         self.load_id = _generate_uuid()
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
+        if self._can_read_data_parallel(plan, planner):
+            return self._read_data_parallel(plan, planner)
+
         # group requests by file
         per_file: dict[str, list[ReadItem]] = {}
         for read_item in plan.items:
@@ -921,6 +974,113 @@ class FileSystemReader(StorageReader):
                             )
                         target_tensor.copy_(tensor)
                         planner.commit_tensor(req, target_tensor)
+
+        fut: Future = Future()
+        fut.set_result(None)
+        return fut
+
+    def _can_read_data_parallel(self, plan: LoadPlan, planner: LoadPlanner) -> bool:
+        return (
+            self.thread_count > 1
+            # Local files only: FsspecReader and others bring their own FileSystem.
+            and type(self.fs) is FileSystem
+            # Stream transforms (e.g. compression) need the serial path.
+            and not any(
+                self.storage_data[req.storage_index].transform_descriptors
+                for req in plan.items
+            )
+            and _has_thread_safe_tensor_hooks(planner)
+        )
+
+    def _read_data_parallel(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
+        """Read items on ``thread_count`` threads, tensor bytes straight into targets.
+
+        Only an item's zip header and directory are read to decode it, as a view of
+        its still-unread bytes. Those bytes then go from disk into the target, through
+        a pinned chunk for accelerator targets. ``load_bytes`` runs on this thread.
+        """
+        # TODO: pytorch#194881 splits read_data into decode/resolve/apply steps and
+        # adds a similar _load_aliased; share them once both land.
+        thread_state = threading.local()
+
+        def read_tensor(stream: io.IOBase, target: Tensor, offset: int) -> None:
+            target_bytes = target.view(-1).view(torch.uint8)
+            if target_bytes.device.type == "cpu":
+                _read_into(stream, target_bytes.numpy().data, offset)
+                return
+            if not hasattr(thread_state, "staging"):
+                thread_state.staging = torch.empty(
+                    _STAGING_CHUNK_BYTES, dtype=torch.uint8, pin_memory=True
+                )
+            for start in range(0, target_bytes.numel(), _STAGING_CHUNK_BYTES):
+                chunk = target_bytes[start : start + _STAGING_CHUNK_BYTES]
+                staging = thread_state.staging[: chunk.numel()]
+                _read_into(stream, staging.numpy().data, offset + start)
+                chunk.copy_(staging)
+
+        def read_item(req: ReadItem) -> io.BytesIO | None:
+            item_md: _StorageInfo = self.storage_data[req.storage_index]
+            path = self.fs.concat_path(self.path, item_md.relative_path)
+            # Anonymous mmap: file-like for the zip reader; unread pages use no memory.
+            blob = mmap.mmap(-1, item_md.length)
+            view = memoryview(blob)
+            with self.fs.create_stream(path, "rb") as stream:
+                if req.type == LoadItemType.BYTE_IO:
+                    _read_into(stream, view, item_md.offset)
+                    return io.BytesIO(blob)
+                head, tail = view[:_ZIP_EDGE_BYTES], view[-_ZIP_EDGE_BYTES:]
+                _read_into(stream, head, item_md.offset)
+                _read_into(stream, tail, item_md.offset + item_md.length - len(tail))
+                storage = torch.frombuffer(blob, dtype=torch.uint8).untyped_storage()
+                with _open_zipfile_reader(cast(IO[bytes], blob)) as zip_file:
+                    # _load byteswaps foreign-endian bytes in place: read them first.
+                    read_all = zip_file.has_record("byteorder") and (
+                        zip_file.get_record("byteorder") != sys.byteorder.encode()
+                    )
+                    if read_all:
+                        _read_into(stream, view, item_md.offset)
+                    tensor = _load(
+                        zip_file,
+                        "cpu",
+                        _weights_only_unpickler,
+                        overall_storage=storage,
+                        weights_only=True,
+                    )
+                tensor = narrow_tensor_by_index(
+                    tensor, req.storage_offsets, req.lengths
+                )
+                target_tensor = planner.resolve_tensor(req).detach()
+                if target_tensor.size() != tensor.size():
+                    raise AssertionError(
+                        f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                    )
+                if (
+                    not read_all
+                    and tensor.is_contiguous()
+                    and target_tensor.is_contiguous()
+                    and tensor.dtype == target_tensor.dtype
+                ):
+                    tensor_offset = tensor.data_ptr() - storage.data_ptr()
+                    read_tensor(stream, target_tensor, item_md.offset + tensor_offset)
+                else:
+                    if not read_all:
+                        _read_into(stream, view, item_md.offset)
+                    target_tensor.copy_(tensor)
+            planner.commit_tensor(req, target_tensor)
+            return None
+
+        # Largest first, so a big tensor is not the last item to start.
+        # TODO: pytorch#193022 sorts the serial path by offset for filesystem
+        # readahead; check that order here on network filesystems.
+        items = sorted(
+            plan.items,
+            key=lambda req: self.storage_data[req.storage_index].length,
+            reverse=True,
+        )
+        with ThreadPoolExecutor(self.thread_count) as pool:
+            for req, read_bytes in zip(items, pool.map(read_item, items)):
+                if read_bytes is not None:
+                    planner.load_bytes(req, read_bytes)
 
         fut: Future = Future()
         fut.set_result(None)
